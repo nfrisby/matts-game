@@ -67,11 +67,7 @@ function serverMessage(message,joinedRoom,sayHiTo,wasSaid,serverError) {
   dispatch['SayHiTo'] = sayHiTo;
   dispatch['WasSaid'] = wasSaid;
   dispatch['ServerError'] = serverError;
-  var tag = message.tag;
-  var contents = message.contents;
-  delete message.tag;
-  delete message.contents; // now message just has the record fields, if any were present
-  return dispatch[tag].apply(message,contents)
+  return cases(message,dispatch)
 }
 |]
 
