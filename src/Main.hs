@@ -136,9 +136,8 @@ wsHandler rooms req = do
           withRoom room (return ()) $ liftIO . readMVar >=> broadcast (WasSaid room name text)
         NewRoom -> do
           now <- liftIO getCPUTime
-          ip <- return "ip" -- fmap (show . remoteHost . reqWaiRequest) getRequest
+          ip <- return "ip" -- how to determine client IP?
           let SipHash tag = hash (SipKey 0 0) $ BC.pack $ show now ++ ip
-
           newRoom (tshow tag)
         JoinRoom room -> do
           name <- liftIO $ readIORef nameRef
@@ -149,7 +148,8 @@ wsHandler rooms req = do
             liftIO $ modifyIORef roomsRef $ ((room,mvar):)
             broadcast (Door room True name) clients
         LeaveRoom room -> do
-          withRoom room (return ()) $ leaveRoom room
+          name <- liftIO $ readIORef nameRef
+          withRoom room (return ()) $ leaveRoom name room
           liftIO $ modifyIORef roomsRef $ filter ((/=room) . fst)
 
       newRoom room = do
@@ -158,15 +158,16 @@ wsHandler rooms req = do
 
         liftIO $ modifyIORef roomsRef $ ((room,roomV):)
         serverMessage $ JoinedRoom room []
-      leaveRoom room roomV = do
-        name <- liftIO $ readIORef nameRef
+      leaveRoom name room roomV = do
         clients <- liftIO $ filter ((/=sink) . clientSink) `liftM` takeMVar roomV
         liftIO $ putMVar roomV clients
         broadcast (Door room False name) clients
 
   WS.catchWsError (forever loop) $ \e -> case fromException e of
      Just x -> case x of
-       WS.ConnectionClosed -> liftIO (readIORef roomsRef) >>= mapM_ (uncurry leaveRoom)
+       WS.ConnectionClosed -> do
+         name <- liftIO $ readIORef nameRef
+         liftIO (readIORef roomsRef) >>= mapM_ (uncurry (leaveRoom name))
        _ -> serverError $ T.append "FATAL " $ tshow x
      Nothing -> WS.throwWsError e
 
