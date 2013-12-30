@@ -1,9 +1,12 @@
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeFamilies #-}
 
 module Main where
+
+import GHC.Generics
 
 import Yesod
 import Yesod.Core.Dispatch (toWaiAppPlain)
@@ -33,6 +36,44 @@ import Network.Wai.Handler.Warp
     (runSettings, defaultSettings, settingsPort, settingsIntercept)
 import qualified Network.Wai.Handler.WebSockets as WaiWS
 import qualified Network.WebSockets as WS
+
+
+
+type Nickname = Text
+
+data ClientMessage = ChangeNick Nickname | Say Text | NewRoom | JoinRoom Word64 deriving Generic
+instance FromJSON ClientMessage
+instance ToJSON ClientMessage
+clientCtors = [julius|
+function ChangeNick(nickname) {
+  return {tag:'ChangeNick',contents:[nickname]}
+}
+function Say(text) {
+  return {tag:'Say',contents:[text]}
+}
+var NewRoom = {tag: 'NewRoom',contents:[]};
+function JoinRoom(tag) {
+  return {tag:'JoinRoom',contents:[tag]}
+}
+|]
+
+data ServerMessage = JoinedRoom Word64 [Nickname] | SayHiTo Nickname | WasSaid Text | ServerError Text deriving Generic
+instance FromJSON ServerMessage
+instance ToJSON ServerMessage
+serverScott = [julius|
+function serverMessage(message,joinedRoom,sayHiTo,wasSaid,serverError) {
+  var dispatch = {};
+  dispatch['JoinedRoom'] = joinedRoom;
+  dispatch['SayHiTo'] = sayHiTo;
+  dispatch['WasSaid'] = wasSaid;
+  dispatch['ServerError'] = serverError;
+  var tag = message.tag;
+  var contents = message.contents;
+  delete message.tag;
+  delete message.contents; // now message just has the record fields, if any were present
+  return dispatch[tag].apply(message,contents)
+}
+|]
 
 data Client = Client (IORef Text) (WS.Sink WS.Hybi00)
 type AppState = MVar (Map Word64 (MVar [Client]))
