@@ -90,12 +90,15 @@ getHomeR = defaultLayout $ do
   addScript JSR
 
   toWidget [julius|
-var wsPort = #{toJSON port}
+var wsPort = #{toJSON port};
+^{clientCtors}
 |]
   toWidget [whamlet|
 $newline never
 <textarea #box>
-<ol #messages>
+<div #messages>
+  <ul .messages>
+  <ul .others>
 |]
 
 tshow :: Show a => a -> T.Text
@@ -155,7 +158,6 @@ wsHandler rooms req = do
       newRoom room = do
         roomV <- liftIO $ newMVar [Client nameRef sink]
         liftIO $ modifyMVar_ rooms $ return . Map.insert room roomV
-
         liftIO $ modifyIORef roomsRef $ ((room,roomV):)
         serverMessage $ JoinedRoom room []
       leaveRoom name room roomV = do
