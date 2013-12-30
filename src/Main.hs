@@ -18,19 +18,20 @@ import qualified Data.ByteString.Char8 as BC
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as T
+import qualified Data.Aeson as JS
 
 import Network.Wai (remoteHost)
 import Crypto.MAC.SipHash (SipKey(..),SipHash(..),hash)
 import System.CPUTime (getCPUTime)
 
-import Data.IORef (IORef,newIORef,readIORef,writeIORef)
-import Control.Concurrent (MVar,newMVar,modifyMVar_,readMVar)
+import Data.IORef (IORef,newIORef,readIORef,writeIORef,modifyIORef)
+import Control.Concurrent (MVar,newMVar,takeMVar,putMVar,modifyMVar_,readMVar)
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (fromMaybe)
 import Data.Word (Word64)
 import Control.Exception (fromException)
-import Control.Monad (when,liftM)
+import Control.Monad (when,liftM,forM_,forever,(>=>))
 
 import Network.Wai.Handler.Warp
     (runSettings, defaultSettings, settingsPort, settingsIntercept)
@@ -40,39 +41,33 @@ import qualified Network.WebSockets as WS
 
 
 type Nickname = Text
+type Room = Text
 
-data ClientMessage = ChangeNick Nickname | Say Text | NewRoom | JoinRoom Word64 deriving Generic
+data ClientMessage = ChangeNick Nickname | Say Room Text | NewRoom | JoinRoom Room | LeaveRoom Room deriving Generic
 instance FromJSON ClientMessage
 instance ToJSON ClientMessage
 clientCtors = [julius|
 function ChangeNick(nickname) {
   return {tag:'ChangeNick',contents:[nickname]}
 }
-function Say(text) {
-  return {tag:'Say',contents:[text]}
+function Say(room,text) {
+  return {tag:'Say',contents:[room,text]}
 }
 var NewRoom = {tag: 'NewRoom',contents:[]};
-function JoinRoom(tag) {
-  return {tag:'JoinRoom',contents:[tag]}
+function JoinRoom(room) {
+  return {tag:'JoinRoom',contents:[room]}
+}
+function LeaveRoom(room) {
+  return {tag:'LeaveRoom',contents:[room]}
 }
 |]
 
-data ServerMessage = JoinedRoom Word64 [Nickname] | SayHiTo Nickname | WasSaid Text | ServerError Text deriving Generic
+data ServerMessage = JoinedRoom Room [Nickname] | Door Room Bool Nickname | WasSaid Room Nickname Text | ServerError Text deriving Generic
 instance FromJSON ServerMessage
 instance ToJSON ServerMessage
-serverScott = [julius|
-function serverMessage(message,joinedRoom,sayHiTo,wasSaid,serverError) {
-  var dispatch = {};
-  dispatch['JoinedRoom'] = joinedRoom;
-  dispatch['SayHiTo'] = sayHiTo;
-  dispatch['WasSaid'] = wasSaid;
-  dispatch['ServerError'] = serverError;
-  return cases(message,dispatch)
-}
-|]
 
-data Client = Client (IORef Text) (WS.Sink WS.Hybi00)
-type AppState = MVar (Map Word64 (MVar [Client]))
+data Client = Client { clientName :: IORef Nickname , clientSink :: WS.Sink WS.Hybi00 }
+type AppState = MVar (Map Room (MVar [Client]))
 data App = App { _rooms :: AppState , _port :: Int }
 instance Yesod App
 
@@ -103,43 +98,76 @@ $newline never
 <ol #messages>
 |]
 
+tshow :: Show a => a -> T.Text
+tshow = T.pack . show
+
+serverMessage msg = WS.sendTextData $ JS.encode msg
+serverError text = serverMessage $ ServerError text
+
 wsHandler :: AppState -> WS.Request -> WS.WebSockets WS.Hybi00 ()
 wsHandler rooms req = do
   WS.acceptRequest req
   sink <- WS.getSink
 
-  now <- liftIO getCPUTime
-  ip <- return "ip" -- fmap (show . remoteHost . reqWaiRequest) getRequest
-  let SipHash tag = hash (SipKey 0 0) $ BC.pack $ show now ++ ip
+  let withRoom room kN kJ = do
+        room <- liftIO $ Map.lookup room `liftM` readMVar rooms
+        case room of
+          Nothing -> kN
+          Just room -> kJ room
+      broadcast msg clients =
+        forM_ clients $ \(Client _ sink') ->
+          when (sink /= sink') $ serverMessage msg
 
-  nameRef <- liftIO $ newIORef ""
-  room <- liftIO $ newMVar [Client nameRef sink]
-  liftIO $ modifyMVar_ rooms $ return . Map.insert tag room
+  let firstLoop = do
+        bs <- WS.receiveData
+        case JS.decode bs of
+          Just (ChangeNick nick) -> liftIO $ newIORef nick
+          _ -> (>> firstLoop) $ serverError "Ignoring messages except for ChangeNick"
+  nameRef <- firstLoop
+  roomsRef <- liftIO $ newIORef []
 
-  let tshow :: Show a => a -> T.Text
-      tshow = T.pack . show
+  let loop = WS.receiveData >>= \bs -> case JS.decode bs of
+        Nothing -> serverError "Could not parse command"
+        Just msg -> handle msg
+      handle msg = case msg of
+        ChangeNick name -> liftIO $ writeIORef nameRef name
+        Say room text -> do
+          name <- liftIO $ readIORef nameRef
+          withRoom room (return ()) $ liftIO . readMVar >=> broadcast (WasSaid room name text)
+        NewRoom -> do
+          now <- liftIO getCPUTime
+          ip <- return "ip" -- fmap (show . remoteHost . reqWaiRequest) getRequest
+          let SipHash tag = hash (SipKey 0 0) $ BC.pack $ show now ++ ip
 
-  WS.sendTextData $ T.append "MSG Joined room " $ tshow tag
+          newRoom (tshow tag)
+        JoinRoom room -> do
+          name <- liftIO $ readIORef nameRef
+          withRoom room (newRoom room) $ \mvar -> do
+            clients <- liftIO $ takeMVar mvar
+            liftIO $ putMVar mvar $ (Client nameRef sink):clients
+            liftIO (mapM (readIORef . clientName) clients) >>= serverMessage . JoinedRoom room
+            liftIO $ modifyIORef roomsRef $ ((room,mvar):)
+            broadcast (Door room True name) clients
+        LeaveRoom room -> do
+          withRoom room (return ()) $ leaveRoom room
+          liftIO $ modifyIORef roomsRef $ filter ((/=room) . fst)
 
-  let loop name = do
-        text <- WS.receiveData
-        case text of
-          _ | Just name <- T.stripPrefix "/nick " text -> do
-                liftIO $ writeIORef nameRef name
-                loop name
-          _ | "/" `T.isPrefixOf` text -> do
-                WS.sendTextData ("MSG Unknown command." :: T.Text)
-                loop name
-          _ | otherwise -> do
-                let (tag,msg) = T.break (==' ') text
-                (liftIO (readMVar room) >>=) $ mapM_ $ \(Client _ sink') ->
-                  when (sink /= sink') $ WS.sendTextData $ T.concat ["SAID ",name,": ",msg]
-                loop name
+      newRoom room = do
+        roomV <- liftIO $ newMVar [Client nameRef sink]
+        liftIO $ modifyMVar_ rooms $ return . Map.insert room roomV
 
-  WS.catchWsError (loop "") $ \e -> case fromException e of
+        liftIO $ modifyIORef roomsRef $ ((room,roomV):)
+        serverMessage $ JoinedRoom room []
+      leaveRoom room roomV = do
+        name <- liftIO $ readIORef nameRef
+        clients <- liftIO $ filter ((/=sink) . clientSink) `liftM` takeMVar roomV
+        liftIO $ putMVar roomV clients
+        broadcast (Door room False name) clients
+
+  WS.catchWsError (forever loop) $ \e -> case fromException e of
      Just x -> case x of
-       WS.ConnectionClosed -> return ()
-       _ -> WS.sendTextData $ T.append "FATAL " $ tshow x
+       WS.ConnectionClosed -> liftIO (readIORef roomsRef) >>= mapM_ (uncurry leaveRoom)
+       _ -> serverError $ T.append "FATAL " $ tshow x
      Nothing -> WS.throwWsError e
 
 main :: IO ()
